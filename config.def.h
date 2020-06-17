@@ -83,6 +83,7 @@ char *termname = "st-256color";
 unsigned int tabspaces = 8;
 
 /* Terminal colors (16 first used in escape sequence) */
+/* Solarized color scheme */
 static const char *colorname[] = {
   /* 8 normal colors */
   "#073642",
