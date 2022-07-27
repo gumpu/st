@@ -11,13 +11,15 @@ static int borderpx = 8;
 /*
  * What program is execed by st depends of these precedence rules:
  * 1: program passed with -e
- * 2: utmp option
+ * 2: scroll and/or utmp
  * 3: SHELL environment variable
  * 4: value of shell in /etc/passwd
  * 5: value of shell in config.h
  */
 static char *shell = "/bin/sh";
 char *utmp = NULL;
+/* scroll program: to enable use a string like "scroll" */
+char *scroll = NULL;
 char *stty_args = "stty raw pass8 nl -echo -iexten -cstopb 38400";
 
 /* identification sequence returned in DA and DECID */
@@ -30,9 +32,9 @@ static float chscale = 1.0;
 /*
  * word delimiter string
  *
- * More advanced example: " `'\"()[]{}"
+ * More advanced example: L" `'\"()[]{}"
  */
-char *worddelimiters = " ";
+wchar_t *worddelimiters = L" ";
 
 /* selection timeouts (in milliseconds) */
 static unsigned int doubleclicktimeout = 300;
@@ -41,9 +43,18 @@ static unsigned int tripleclicktimeout = 600;
 /* alt screens */
 int allowaltscreen = 1;
 
-/* frames per second st should at maximum draw to the screen */
-static unsigned int xfps = 120;
-static unsigned int actionfps = 30;
+/* allow certain non-interactive (insecure) window operations such as:
+   setting the clipboard text */
+int allowwindowops = 0;
+
+/*
+ * draw latency range in ms - from new content/keypress/etc until drawing.
+ * within this range, st draws when content stops arriving (idle). mostly it's
+ * near minlatency, but it waits longer for slow updates to avoid partial draw.
+ * low minlatency will tear/flicker more, as it can "detect" idle too early.
+ */
+static double minlatency = 8;
+static double maxlatency = 33;
 
 /*
  * blinking timeout (set to 0 to disable blinking) for the terminal blinking
@@ -85,31 +96,44 @@ unsigned int tabspaces = 8;
 /* Terminal colors (16 first used in escape sequence) */
 /* Solarized color scheme */
 static const char *colorname[] = {
-  /* 8 normal colors */
-  "#073642",
-  "#dc322f",
-  "#859900",
-  "#b58900",
-  "#268bd2",
-  "#d33682",
-  "#2aa198",
-  "#eee8d5",
+	/* solarized dark */
+	"#073642",  /*  0: black    */
+	"#dc322f",  /*  1: red      */
+	"#859900",  /*  2: green    */
+	"#b58900",  /*  3: yellow   */
+	"#268bd2",  /*  4: blue     */
+	"#d33682",  /*  5: magenta  */
+	"#2aa198",  /*  6: cyan     */
+	"#eee8d5",  /*  7: white    */
+	"#002b36",  /*  8: brblack  */
+	"#cb4b16",  /*  9: brred    */
+	"#586e75",  /* 10: brgreen  */
+	"#657b83",  /* 11: bryellow */
+	"#839496",  /* 12: brblue   */
+	"#6c71c4",  /* 13: brmagenta*/
+	"#93a1a1",  /* 14: brcyan   */
+	"#fdf6e3",  /* 15: brwhite  */
+};
 
-  /* 8 bright colors */
-  "#002b36",
-  "#cb4b16",
-  "#586e75",
-  "#657b83",
-  "#839496",
-  "#6c71c4",
-  "#93a1a1",
-  "#fdf6e3",
-
-  [255] = 0,
-
-  /* more colors can be added after 255 to use with DefaultXX */
-  "#cccccc",
-  "#333333",
+/* Terminal colors for alternate (light) palette */
+static const char *altcolorname[] = {
+	/* solarized light */
+	"#eee8d5",  /*  0: black    */
+	"#dc322f",  /*  1: red      */
+	"#859900",  /*  2: green    */
+	"#b58900",  /*  3: yellow   */
+	"#268bd2",  /*  4: blue     */
+	"#d33682",  /*  5: magenta  */
+	"#2aa198",  /*  6: cyan     */
+	"#073642",  /*  7: white    */
+	"#fdf6e3",  /*  8: brblack  */
+	"#cb4b16",  /*  9: brred    */
+	"#93a1a1",  /* 10: brgreen  */
+	"#839496",  /* 11: bryellow */
+	"#657b83",  /* 12: brblue   */
+	"#6c71c4",  /* 13: brmagenta*/
+	"#586e75",  /* 14: brcyan   */
+	"#002b36",  /* 15: brwhite  */
 };
 
 
@@ -119,8 +143,8 @@ static const char *colorname[] = {
  */
 unsigned int defaultfg = 12;
 unsigned int defaultbg = 8;
-static unsigned int defaultcs = 256;
-static unsigned int defaultrcs = 257;
+unsigned int defaultcs = 14;
+static unsigned int defaultrcs = 15;
 
 /*
  * Default shape of cursor
@@ -152,13 +176,23 @@ static unsigned int mousebg = 0;
 static unsigned int defaultattr = 11;
 
 /*
+ * Force mouse select/shortcuts while mask is active (when MODE_MOUSE is set).
+ * Note that if you want to use ShiftMask with selmasks, set this to an other
+ * modifier, set to 0 to not use it.
+ */
+static uint forcemousemod = ShiftMask;
+
+/*
  * Internal mouse shortcuts.
  * Beware that overloading Button1 will disable the selection.
  */
 static MouseShortcut mshortcuts[] = {
-	/* button               mask            string */
-	{ Button4,              XK_ANY_MOD,     "\031" },
-	{ Button5,              XK_ANY_MOD,     "\005" },
+	/* mask                 button   function        argument       release */
+	{ XK_ANY_MOD,           Button2, selpaste,       {.i = 0},      1 },
+	{ ShiftMask,            Button4, ttysend,        {.s = "\033[5;2~"} },
+	{ XK_ANY_MOD,           Button4, ttysend,        {.s = "\031"} },
+	{ ShiftMask,            Button5, ttysend,        {.s = "\033[6;2~"} },
+	{ XK_ANY_MOD,           Button5, ttysend,        {.s = "\005"} },
 };
 
 /* Internal keyboard shortcuts. */
@@ -177,8 +211,9 @@ static Shortcut shortcuts[] = {
 	{ TERMMOD,              XK_C,           clipcopy,       {.i =  0} },
 	{ TERMMOD,              XK_V,           clippaste,      {.i =  0} },
 	{ TERMMOD,              XK_Y,           selpaste,       {.i =  0} },
+	{ ShiftMask,            XK_Insert,      selpaste,       {.i =  0} },
 	{ TERMMOD,              XK_Num_Lock,    numlock,        {.i =  0} },
-	{ TERMMOD,              XK_I,           iso14755,       {.i =  0} },
+	{ XK_ANY_MOD,           XK_F6,          swapcolors,     {.i =  0} },
 };
 
 /*
@@ -196,10 +231,6 @@ static Shortcut shortcuts[] = {
  * * 0: no value
  * * > 0: cursor application mode enabled
  * * < 0: cursor application mode disabled
- * crlf value
- * * 0: no value
- * * > 0: crlf mode is enabled
- * * < 0: crlf mode is disabled
  *
  * Be careful with the order of the definitions because st searches in
  * this table sequentially, so any XK_ANY_MOD must be in the last
@@ -217,13 +248,6 @@ static KeySym mappedkeys[] = { -1 };
  * numlock (Mod2Mask) and keyboard layout (XK_SWITCH_MOD) are ignored.
  */
 static uint ignoremod = Mod2Mask|XK_SWITCH_MOD;
-
-/*
- * Override mouse-select while mask is active (when MODE_MOUSE is set).
- * Note that if you want to use ShiftMask with selmasks, set this to an other
- * modifier, set to 0 to not use it.
- */
-static uint forceselmod = ShiftMask;
 
 /*
  * This is the huge key array which defines all compatibility to the Linux
